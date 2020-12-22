@@ -1,147 +1,219 @@
 package com.github.jonnybgod.RNEventSource;
+import androidx.annotation.WorkerThread;
 
-import java.io.IOException;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.Headers;
+import okhttp3.FormBody;
 
-import com.facebook.common.logging.FLog;
-import com.facebook.react.bridge.Arguments;
+import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
-import com.facebook.react.bridge.ReactContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
+import com.facebook.react.bridge.ReadableArray;
+import com.facebook.react.bridge.ReadableMap;
+import com.facebook.react.bridge.ReadableMapKeySetIterator;
+import com.facebook.react.bridge.ReadableType;
 import com.facebook.react.bridge.WritableMap;
-import com.facebook.react.common.ReactConstants;
+import com.facebook.react.bridge.WritableNativeMap;
+import com.here.oksse.OkSse;
+import com.here.oksse.ServerSentEvent;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
+
 import com.facebook.react.modules.core.DeviceEventManagerModule;
 
-import java.net.URI;
-import java.net.URL;
-
-import org.kaazing.net.sse.SseEventReader;
-import org.kaazing.net.sse.SseEventSource;
-import org.kaazing.net.sse.SseEventSourceFactory;
-import org.kaazing.net.sse.SseEventType;
-
-import java.util.HashMap;
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
 public class RNEventSourceModule extends ReactContextBaseJavaModule {
-
-  private Map<Integer, SseEventSource> mEventSourceConnections = new HashMap<>();
-  private Map<Integer, Thread> mEventReaderThreads = new HashMap<>();
-
-  private SseEventSourceFactory factory = SseEventSourceFactory.createEventSourceFactory();
-  private ReactContext mReactContext;
+  private static ReactApplicationContext reactContext;
+  private OkSse okSse;
+  private HashMap<String, ServerSentEvent> sseManager;
+  private int sseCount;
+  final String sseRefID = "0";
 
   public RNEventSourceModule(ReactApplicationContext context) {
     super(context);
-    mReactContext = context;
+    reactContext = context;
+    this.okSse = new OkSse();
+    this.sseManager = new HashMap(100);
   }
-
-  private void sendEvent(String eventName, WritableMap params) {
-    mReactContext
-      .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-      .emit(eventName, params);
-  }
-
-  @Override
+ 
   public String getName() {
-    return "RNEventSource";
+    return "EventSource";
   }
 
+
+  private HashMap<String, Object> recursivelyDeconstructReadableMap(ReadableMap readableMap) {
+    ReadableMapKeySetIterator iterator = readableMap.keySetIterator();
+    HashMap<String, Object> deconstructedMap = new HashMap<>();
+    while (iterator.hasNextKey()) {
+      String key = iterator.nextKey();
+      ReadableType type = readableMap.getType(key);
+      switch (type) {
+        case Null:
+          deconstructedMap.put(key, null);
+          break;
+        case Boolean:
+          deconstructedMap.put(key, readableMap.getBoolean(key));
+          break;
+        case Number:
+          deconstructedMap.put(key, readableMap.getDouble(key));
+          break;
+        case String:
+          deconstructedMap.put(key, readableMap.getString(key));
+          break;
+        case Map:
+          deconstructedMap.put(key, recursivelyDeconstructReadableMap(readableMap.getMap(key)));
+          break;
+        case Array:
+          deconstructedMap.put(key, recursivelyDeconstructReadableArray(readableMap.getArray(key)));
+          break;
+        default:
+          throw new IllegalArgumentException("Could not convert object with key: " + key + ".");
+      }
+
+    }
+    return deconstructedMap;
+  }
+
+  private List<Object> recursivelyDeconstructReadableArray(ReadableArray readableArray) {
+    List<Object> deconstructedList = new ArrayList<>(readableArray.size());
+    for (int i = 0; i < readableArray.size(); i++) {
+      ReadableType indexType = readableArray.getType(i);
+      switch(indexType) {
+        case Null:
+          deconstructedList.add(i, null);
+          break;
+        case Boolean:
+          deconstructedList.add(i, readableArray.getBoolean(i));
+          break;
+        case Number:
+          deconstructedList.add(i, readableArray.getDouble(i));
+          break;
+        case String:
+          deconstructedList.add(i, readableArray.getString(i));
+          break;
+        case Map:
+          deconstructedList.add(i, recursivelyDeconstructReadableMap(readableArray.getMap(i)));
+          break;
+        case Array:
+          deconstructedList.add(i, recursivelyDeconstructReadableArray(readableArray.getArray(i)));
+          break;
+        default:
+          throw new IllegalArgumentException("Could not convert object at index " + i + ".");
+      }
+    }
+    return deconstructedList;
+  }
+
+
+  // returns an SSE id which you need to refer back to for closing the connection
+  // assumes that you're making a GET request, but you can also modify this to accept POST/PATCH requests as well
   @ReactMethod
-  public void connect(final String url, final int id) {
-    try {
+  public void initRequest(
+          String path,
+          ReadableMap headersMap,
+          Promise promise
+  ) {
+    Request.Builder requestBuilder = new Request.Builder().url(path);
 
-      final SseEventSource source = factory.createEventSource(new URI(url));
 
-      source.connect();
+    HashMap<String, Object> headersHashMap = recursivelyDeconstructReadableMap(headersMap);
+    for (Map.Entry<String, Object> entry : headersHashMap.entrySet()) {
+      String headerKey = entry.getKey();
+      String headerValue = (String) entry.getValue(); // assumes that the key-value JSON passed into headers are <String, String>
+      requestBuilder.addHeader(headerKey, headerValue);
+    }
 
-      mEventSourceConnections.put(id, source);
-      WritableMap params = Arguments.createMap();
-      params.putInt("id", id);
-      sendEvent("eventsourceOpen", params);
+    final Request request = requestBuilder.build();
 
-      Thread sseEventReaderThread = new Thread() {
-        public void run() {
-          try {
-            SseEventReader reader = source.getEventReader();
-     
-            SseEventType type = null;
-            while ((type = reader.next()) != SseEventType.EOS) {
-              switch (type) {
-                case DATA:
-                  String name;
-                  String data;
-                  try {
-                    name = reader.getName();
-                    data = reader.getData().toString();
-                  } catch (IOException e) {
-                    notifyEventSourceFailed(id, e.getMessage());
-                    return;
-                  }
+    ServerSentEvent sse = this.okSse.newServerSentEvent(request, new ServerSentEvent.Listener() {
+      @Override
+      public void onOpen(ServerSentEvent sse, Response response) {
 
-                  WritableMap params = Arguments.createMap();
-                  params.putInt("id", id);
-                  params.putString("type", name != null ? name : "message");
-                  params.putString("data", data);
-                  sendEvent("eventsourceEvent", params);
-                  break;
-                case EMPTY:
-                  break;
-              }
-            }
-            
-            notifyEventSourceFailed(id, "Connection with the event source was closed.");
-            close(id);
-          }
-          catch (Exception e) {
-            notifyEventSourceFailed(id, e.getMessage());
-
-            Thread.currentThread().interrupt();
-            mEventReaderThreads.remove(id);
+        WritableMap map = new WritableNativeMap();
+          if(!reactContext.hasActiveCatalystInstance()) {
             return;
-          }
         }
-      };
 
-      sseEventReaderThread.start();
-      mEventReaderThreads.put(id, sseEventReaderThread);
-    }
-    catch (Exception e) {
-      notifyEventSourceFailed(id, e.getMessage());
-    }
+        reactContext
+                .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                .emit("open", map);
+      }
+
+      @Override
+      public void onMessage(ServerSentEvent sse, String id, String event, String message) {
+        // When a message is received
+        WritableMap map = new WritableNativeMap();
+        map.putString("id", id);
+        map.putString("event", event);
+        map.putString("message", message);
+
+          if(!reactContext.hasActiveCatalystInstance()) {
+            return;
+        }
+
+        reactContext
+                .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                .emit("message", map);
+      }
+
+      @WorkerThread
+      @Override
+      public void onComment(ServerSentEvent sse, String comment) {
+        WritableMap map = new WritableNativeMap();
+        map.putString("comment", comment);
+
+          if(!reactContext.hasActiveCatalystInstance()) {
+            return;
+        }
+
+        reactContext
+                .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+                .emit("comment", map); // this identifies the HTTP connection and respective SSEs we want to be listening to on JS
+      }
+
+      @WorkerThread
+      @Override
+      public Request onPreRetry(ServerSentEvent sse, Request sseRequest) {
+        return request;
+      }
+
+      @WorkerThread
+      @Override
+      public boolean onRetryTime(ServerSentEvent sse, long milliseconds) {
+        return true; // True to use the new retry time received by SSE
+      }
+
+      @WorkerThread
+      @Override
+      public boolean onRetryError(ServerSentEvent sse, Throwable throwable, Response response) {
+        return true; // True to retry, false otherwise
+      }
+
+      @WorkerThread
+      @Override
+      public void onClosed(ServerSentEvent sse) {
+        // Channel closed
+        sse.close();
+      }
+    });
+    this.sseManager.put(sseRefID, sse);
+    this.sseCount++;
+    promise.resolve(sseRefID);
   }
 
   @ReactMethod
-  public void close(int id) {
-    SseEventSource source = mEventSourceConnections.get(id);
-    Thread thead = mEventReaderThreads.get(id);
-    if (source == null) {
-      // EventSource is already closed
-      // Don't do anything, mirror the behaviour on web
-      FLog.w(
-        ReactConstants.TAG,
-        "Cannot close EventSource. Unknown EventSource id " + id);
-
-      return;
-    }
+  public void close() {
     try {
-      thead.interrupt();
-      source.close();
-      mEventSourceConnections.remove(id);
-      mEventReaderThreads.remove(id);
+      this.sseManager.get(sseRefID).close();
+      this.sseManager.remove(sseRefID);
     } catch (Exception e) {
-      FLog.e(
-        ReactConstants.TAG,
-        "Could not close EventSource connection for id " + id,
-        e);
+      System.out.println("failed to close connection");
     }
-  }
-
-  private void notifyEventSourceFailed(int id, String message) {
-    WritableMap params = Arguments.createMap();
-    params.putInt("id", id);
-    params.putString("message", message);
-    sendEvent("eventsourceFailed", params);
   }
 }
